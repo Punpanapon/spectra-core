@@ -163,7 +163,7 @@ if st.sidebar.button("🚀 Run Fusion", type="primary"):
                 
                 with col1:
                     st.subheader("Enhanced Forest Composite")
-                    st.image(efc_path, caption="EFC Visualization", use_column_width=True)
+                    st.image(efc_path, caption="EFC Visualization", use_container_width=True)
                 
                 with col2:
                     st.subheader("Summary")
