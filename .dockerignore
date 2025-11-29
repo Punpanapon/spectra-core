@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+outputs/
+data/
+.git
+.gitignore
+# Keep env folder ignored EXCEPT environment.yml needed by Dockerfile
+env/*
+!env/environment.yml

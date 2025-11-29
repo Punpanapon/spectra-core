@@ -1,0 +1,20 @@
+# Minimal runtime dependencies for Spectra on Streamlit Community Cloud
+streamlit
+requests
+numpy
+pandas
+rasterio
+rioxarray
+xarray
+scipy
+scikit-image
+shapely
+geopandas
+Pillow
+jinja2
+tqdm
+click
+pyproj
+pystac-client
+stackstac
+google-generativeai

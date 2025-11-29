@@ -1,0 +1,21 @@
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
+enableWebsocketCompression = true
+maxUploadSize = 2048
+maxMessageSize = 2048
+
+[theme]
+primaryColor = "#38B2AC"
+backgroundColor = "#020617"
+secondaryBackgroundColor = "#020617"
+textColor = "#E2E8F0"
+font = "sans serif"
+base = "dark"
+
+[ui]
+hideTopBar = false
+
+[client]
+toolbarMode = "viewer"

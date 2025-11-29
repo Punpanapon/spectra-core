@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: spectra-core
+Version: 0.1.0
+Summary: SPECTRA core
+Requires-Python: >=3.11

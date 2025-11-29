@@ -1,0 +1,11 @@
+# Environment for Spectra Streamlit in Snowflake: minimal and Snowflake-compatible.
+name: spectra_sf_env
+channels:
+  - snowflake
+dependencies:
+  # Do NOT specify python here; Snowflake will choose a supported runtime.
+  - pandas
+  - numpy
+  - plotly
+  - pydeck
+  - requests

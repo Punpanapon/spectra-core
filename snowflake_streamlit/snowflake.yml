@@ -1,0 +1,18 @@
+definition_version: 2
+
+entities:
+  spectra_app:
+    type: streamlit
+    # Snowflake object name for the Streamlit app
+    identifier: SPECTRA_APP
+
+    # Warehouse used to run the app
+    query_warehouse: COMPUTE_WH
+
+    # Main entrypoint file (in this same folder)
+    main_file: streamlit_app_snowflake.py
+
+    # Upload this file along with the app so Snowflake
+    # knows which extra Python packages to install.
+    artifacts:
+      - environment.yml
