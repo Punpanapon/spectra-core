@@ -2,10 +2,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Activate env if available
-if [ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ]; then
-  source "$HOME/miniforge3/etc/profile.d/conda.sh"
-  conda activate spectra || true
+# Activate project venv if available (preferred over system/conda)
+if [ -f ".venv/bin/activate" ]; then
+  source ".venv/bin/activate"
+else
+  echo "⚠️  .venv not found; using current Python. Run: python -m venv .venv && source .venv/bin/activate"
 fi
 
 # LLM env are optional; user can export outside
@@ -14,4 +15,4 @@ if [ -z "${PORT}" ]; then
   PORT=$(python tools/find_free_port.py)
 fi
 echo "Starting Streamlit on port ${PORT}"
-streamlit run app/streamlit_app.py --server.port "${PORT}"
+python -m streamlit run app/streamlit_app.py --server.port "${PORT}"

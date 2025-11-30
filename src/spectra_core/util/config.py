@@ -39,3 +39,28 @@ def get_env_or_secret(key: str, default: str = "") -> str:
 
 def has_env_or_secret(key: str) -> bool:
     return get_env_or_secret(key, "") not in ("", None)
+
+
+def get_fusion_model_path() -> str | None:
+    """
+    Resolve the fusion model path for the optical+SAR overlay.
+
+    Order of precedence:
+      1) st.secrets["ai"]["fusion_model_path"] (if Streamlit is available)
+      2) os.environ["SPECTRA_FUSION_MODEL_PATH"]
+    Strips whitespace and returns None if the final value is empty.
+    """
+    path: str | None = None
+    if st is not None:
+        try:
+            path = st.secrets.get("ai", {}).get("fusion_model_path")  # type: ignore[attr-defined]
+        except StreamlitSecretNotFoundError:
+            path = None
+        except Exception:
+            path = None
+    if not path:
+        path = os.getenv("SPECTRA_FUSION_MODEL_PATH")
+    if path is None:
+        return None
+    path = str(path).strip()
+    return path or None

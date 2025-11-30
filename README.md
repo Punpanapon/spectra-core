@@ -243,7 +243,12 @@ export LLM_ONLINE_TIMEOUT=15
 ### Gemini API quick setup
 - Set: `bash tools/set_gemini_key.sh <KEY> [model]`
 - Verify: `python -m spectra_core.cli.gemini_check`
-- Launch: `streamlit run app/streamlit_app.py`
+- Launch:
+  ```bash
+  cd spectra-core
+  source ../.venv/bin/activate  # create with python -m venv ../.venv if missing
+  python -m streamlit run app/streamlit_app.py
+  ```
 
 **Notes:**
 - Default mode is $0 rule-based analysis

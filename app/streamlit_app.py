@@ -1,5 +1,12 @@
 # ENTRYPOINT FOR STREAMLIT COMMUNITY CLOUD
 # Chosen automatically by Codex based on project structure.
+# Fusion overlay config: resolves ai.fusion_model_path from st.secrets first, then
+# SPECTRA_FUSION_MODEL_PATH, and falls back to a built-in fusion when missing or failed.
+# Example secrets template (.streamlit/secrets.toml):
+# [llm]
+# provider = "openai"
+# api_key = "sk-..."
+# model_name = "gpt-4.1-mini"
 
 import os
 import sys
@@ -13,6 +20,7 @@ import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 import streamlit as st
+import xarray as xr
 import ee
 import random
 import torch
@@ -25,14 +33,26 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 DEFAULT_UNET_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "efc_unet.pt")
 
+def _safe_get_secrets(group: str) -> dict:
+    """Return secrets group or empty dict if secrets.toml is missing/unset."""
+    try:
+        return st.secrets.get(group, {}) if hasattr(st, "secrets") else {}
+    except Exception:
+        return {}
+
 # Secrets/environment handling for Streamlit Cloud and local use
-secrets_llm = st.secrets.get("llm", {}) if hasattr(st, "secrets") else {}
-secrets_news = st.secrets.get("newsdata", {}) if hasattr(st, "secrets") else {}
-secrets_ee = st.secrets.get("earthengine", {}) if hasattr(st, "secrets") else {}
-secrets_ai = st.secrets.get("ai", {}) if hasattr(st, "secrets") else {}
+secrets_llm = _safe_get_secrets("llm")
+secrets_news = _safe_get_secrets("newsdata")
+secrets_ee = _safe_get_secrets("earthengine")
+secrets_ai = _safe_get_secrets("ai")
 
 # Prefer secrets.toml values, fall back to env for local runs
 NEWSDATA_API_KEY = secrets_news.get("api_key") or os.getenv("NEWSDATA_API_KEY")
+
+LLM_PROVIDER = secrets_llm.get("provider") or os.getenv("SPECTRA_LLM_PROVIDER", "none")
+LLM_API_KEY = secrets_llm.get("api_key") or os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL = secrets_llm.get("model_name") or os.getenv("SPECTRA_LLM_MODEL", "gpt-4.1-mini")
+
 if secrets_llm.get("api_key") and not os.getenv("GEMINI_API_KEY"):
     os.environ["GEMINI_API_KEY"] = secrets_llm["api_key"]
 if secrets_llm.get("model") and not os.getenv("GEMINI_MODEL"):
@@ -47,42 +67,51 @@ if secrets_ee.get("service_account") and not os.getenv("EE_SERVICE_ACCOUNT"):
     os.environ["EE_SERVICE_ACCOUNT"] = secrets_ee["service_account"]
 if secrets_ee.get("private_key") and not os.getenv("EE_PRIVATE_KEY"):
     os.environ["EE_PRIVATE_KEY"] = secrets_ee["private_key"]
-def init_earthengine():
+
+def init_earth_engine_from_context():
     """
-    Initialize Earth Engine using credentials from st.secrets['earthengine'].
+    Try Earth Engine init in order:
+      1) Service account from st.secrets['earthengine'] if present.
+      2) Fallback to ee.Initialize() using OAuth credentials (earthengine authenticate).
+
+    For local dev: run `earthengine authenticate` to seed OAuth if no secrets.toml.
+    For production: provide .streamlit/secrets.toml with:
+        [earthengine]
+        service_account = "sa@project.iam.gserviceaccount.com"
+        private_key = \"\"\"-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n\"\"\"
+        project = "your-project-id"
 
     Returns
     -------
-    (ok: bool, message: str)
+    (ok: bool, method: str, details: str)
+      method: 'service_account', 'oauth', or 'none'
     """
-    ee_cfg = st.secrets.get("earthengine", {}) if hasattr(st, "secrets") else {}
+    ee_cfg = _safe_get_secrets("earthengine")
     service_account = ee_cfg.get("service_account")
     key_json = ee_cfg.get("key_json") or ee_cfg.get("private_key")
-    project_id = ee_cfg.get("project_id")
+    project_id = ee_cfg.get("project_id") or ee_cfg.get("project")
 
-    if not service_account or not key_json:
-        return False, "Earth Engine credentials missing in st.secrets['earthengine']"
+    if service_account and key_json:
+        try:
+            credentials = ee.ServiceAccountCredentials(service_account, key_data=key_json)
+            ee.Initialize(credentials=credentials, project=project_id) if project_id else ee.Initialize(
+                credentials=credentials
+            )
+            ee.Number(1).add(1).getInfo()
+            return True, "service_account", service_account
+        except Exception as exc:  # noqa: BLE001
+            # Fall through to OAuth attempt
+            pass
 
     try:
-        credentials = ee.ServiceAccountCredentials(
-            service_account,
-            key_data=key_json,
-        )
-
-        if project_id:
-            ee.Initialize(credentials=credentials, project=project_id)
-        else:
-            ee.Initialize(credentials=credentials)
-
-        # tiny test computation
+        ee.Initialize()
         ee.Number(1).add(1).getInfo()
-        return True, "Earth Engine initialized"
+        return True, "oauth", "default OAuth credentials"
+    except Exception as exc:  # noqa: BLE001
+        return False, "none", str(exc)
 
-    except Exception as e:  # noqa: BLE001
-        return False, f"Earth Engine error: {e}"
 
-
-ee_ok, ee_msg = init_earthengine()
+ee_ok, ee_method, ee_msg = init_earth_engine_from_context()
 
 
 def fetch_environment_news(topic: str, max_articles: int = 6):
@@ -176,13 +205,24 @@ def fetch_environment_news(topic: str, max_articles: int = 6):
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from spectra_core.pipeline import run_pipeline
+import spectra_core.pipeline as pipeline_mod
 from spectra_core.report import generate_report
 from spectra_core.agent.insights import summarize_ndvi, insight_bullets, narrative, qa_answer, load_fusion_summary, llm_caps_from_env
 from spectra_core.agent.llm_providers import LocalLlamaCpp, GeminiProvider, HuggingFaceProvider, OpenAICompatible, OllamaProvider
 from spectra_core.agent.usage_limits import reset_session, get_usage
 from spectra_core.ai.paths import open_da
-from spectra_core.util.config import get_env_or_secret, has_env_or_secret
+try:
+    from spectra_core.util.config import get_env_or_secret, get_fusion_model_path, has_env_or_secret
+except ImportError:
+    # Fallback for environments where the config module is stale or installed from an older build.
+    from spectra_core.util.config import get_env_or_secret, has_env_or_secret  # type: ignore
+
+    def get_fusion_model_path() -> str | None:  # type: ignore
+        """Fallback: only resolve from env if newer helper is missing."""
+        import os
+
+        val = os.getenv("SPECTRA_FUSION_MODEL_PATH", "").strip()
+        return val or None
 from spectra_loader import show_spectra_loader
 try:
     from spectra_ai.infer_unet import run_unet_on_efc_tile
@@ -191,8 +231,13 @@ try:
 except Exception as e:  # noqa: BLE001
     AI_AVAILABLE = False
     AI_IMPORT_ERROR = e
+
+# Export pipeline helpers with a safe fallback for array mode.
+run_pipeline = pipeline_mod.run_pipeline
+_RUN_PIPELINE_ARRAYS = getattr(pipeline_mod, "run_pipeline_arrays", None)
+_RUN_OPTICAL_SAR_ARRAYS = getattr(pipeline_mod, "run_optical_and_sar_unets_from_arrays", None)
 def load_gee_s2_patch(lat, lon, start_date, end_date, cloud_max, patch_size_m):
-    """Fetch a Sentinel-2 patch (B4, B8) from Earth Engine."""
+    """Fetch a Sentinel-2 patch (B4, B3, B2, B8) from Earth Engine."""
     if not ee_ok:
         raise RuntimeError("Earth Engine is not initialized.")
 
@@ -205,7 +250,7 @@ def load_gee_s2_patch(lat, lon, start_date, end_date, cloud_max, patch_size_m):
         .filterBounds(point)
         .filterDate(start_date.isoformat(), end_date.isoformat())
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_max))
-        .select(["B4", "B8"])
+        .select(["B4", "B3", "B2", "B8"])
     ).sort("CLOUDY_PIXEL_PERCENTAGE")
 
     image = collection.first()
@@ -218,31 +263,43 @@ def load_gee_s2_patch(lat, lon, start_date, end_date, cloud_max, patch_size_m):
     print("GEE sampleRectangle keys:", rect_dict.keys())
 
     props = rect_dict.get("properties", rect_dict)
-    if "B4" not in props or "B8" not in props:
+    missing = [b for b in ("B4", "B3", "B2", "B8") if b not in props]
+    if missing:
         raise RuntimeError(
-            f"Unexpected sampleRectangle structure; missing B4/B8 keys. Available keys: {list(props.keys())}"
+            f"Unexpected sampleRectangle structure; missing {missing} keys. Available keys: {list(props.keys())}"
         )
 
     red_arr = np.array(props["B4"])
+    green_arr = np.array(props["B3"])
+    blue_arr = np.array(props["B2"])
     nir_arr = np.array(props["B8"])
 
-    if red_arr.ndim == 3 and red_arr.shape[-1] == 1:
-        red_arr = red_arr[..., 0]
-    if nir_arr.ndim == 3 and nir_arr.shape[-1] == 1:
-        nir_arr = nir_arr[..., 0]
+    def _squeeze(arr: np.ndarray) -> np.ndarray:
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            return arr[..., 0]
+        return arr
 
-    if red_arr.ndim != 2 or nir_arr.ndim != 2:
+    red_arr = _squeeze(red_arr)
+    green_arr = _squeeze(green_arr)
+    blue_arr = _squeeze(blue_arr)
+    nir_arr = _squeeze(nir_arr)
+
+    if any(a.ndim != 2 for a in (red_arr, green_arr, blue_arr, nir_arr)):
         raise RuntimeError(
-            f"Fetched Sentinel-2 arrays are not 2-D rasters. Shapes: B4={red_arr.shape}, B8={nir_arr.shape}"
+            f"Fetched Sentinel-2 arrays are not 2-D rasters. Shapes: "
+            f"B4={red_arr.shape}, B3={green_arr.shape}, B2={blue_arr.shape}, B8={nir_arr.shape}"
         )
 
-    if red_arr.shape != nir_arr.shape:
-        h_min = min(red_arr.shape[0], nir_arr.shape[0])
-        w_min = min(red_arr.shape[1], nir_arr.shape[1])
+    shapes = [red_arr.shape, green_arr.shape, blue_arr.shape, nir_arr.shape]
+    if len(set(shapes)) > 1:
+        h_min = min(s[0] for s in shapes)
+        w_min = min(s[1] for s in shapes)
         red_arr = red_arr[:h_min, :w_min]
+        green_arr = green_arr[:h_min, :w_min]
+        blue_arr = blue_arr[:h_min, :w_min]
         nir_arr = nir_arr[:h_min, :w_min]
 
-    return red_arr, nir_arr
+    return red_arr, nir_arr, green_arr, blue_arr
 
 
 def load_gee_s1_patch(lat, lon, start_date, end_date, patch_size_m):
@@ -321,6 +378,8 @@ def gee_input_panel():
         st.session_state["gee_ready"] = False
         st.session_state["gee_red"] = None
         st.session_state["gee_nir"] = None
+        st.session_state["gee_green"] = None
+        st.session_state["gee_blue"] = None
     if "gee_s1_ready" not in st.session_state:
         st.session_state["gee_s1_ready"] = False
         st.session_state["gee_s1"] = None
@@ -343,7 +402,7 @@ def gee_input_panel():
     if fetch:
         with st.spinner("Fetching Sentinel-2 patch from Earth Engine..."):
             try:
-                red_arr, nir_arr = load_gee_s2_patch(
+                red_arr, nir_arr, green_arr, blue_arr = load_gee_s2_patch(
                     lat=lat,
                     lon=lon,
                     start_date=start_date,
@@ -360,14 +419,23 @@ def gee_input_panel():
                         end_date=end_date,
                         patch_size_m=patch_size,
                     )
+                h_min = red_arr.shape[0]
+                w_min = red_arr.shape[1]
+                h_min = min(h_min, green_arr.shape[0], blue_arr.shape[0], nir_arr.shape[0])
+                w_min = min(w_min, green_arr.shape[1], blue_arr.shape[1], nir_arr.shape[1])
                 if sar_arr is not None:
-                    h_min = min(red_arr.shape[0], sar_arr.shape[0])
-                    w_min = min(red_arr.shape[1], sar_arr.shape[1])
-                    red_arr = red_arr[:h_min, :w_min]
-                    nir_arr = nir_arr[:h_min, :w_min]
+                    h_min = min(h_min, sar_arr.shape[0])
+                    w_min = min(w_min, sar_arr.shape[1])
+                red_arr = red_arr[:h_min, :w_min]
+                nir_arr = nir_arr[:h_min, :w_min]
+                green_arr = green_arr[:h_min, :w_min]
+                blue_arr = blue_arr[:h_min, :w_min]
+                if sar_arr is not None:
                     sar_arr = sar_arr[:h_min, :w_min]
                 st.session_state["gee_red"] = red_arr
                 st.session_state["gee_nir"] = nir_arr
+                st.session_state["gee_green"] = green_arr
+                st.session_state["gee_blue"] = blue_arr
                 st.session_state["gee_ready"] = True
                 st.session_state["gee_params"] = {
                     "lat": lat,
@@ -435,6 +503,7 @@ def run_fusion_from_gee_arrays(
     sar_c_path = None
     if c_sar_arr is not None:
         sar_c_arr = np.asarray(c_sar_arr, dtype=np.float32)
+        sar_c_path = os.path.join(temp_dir, "sar_c.tif")
         with rasterio.open(sar_c_path, "w", **profile) as dst:
             dst.write(sar_c_arr, 1)
 
@@ -442,6 +511,106 @@ def run_fusion_from_gee_arrays(
         red_path, nir_path, sar_c_path=sar_c_path, sar_l_path=None, output_dir=output_dir
     )
     return efc_path, metrics, summary, red_path, nir_path, temp_dir
+
+
+def process_from_files(red_path: str, nir_path: str, sar_c_path: str | None, sar_l_path: str | None,
+                       output_dir: str):
+    """File-based fusion pipeline; validates paths before calling run_pipeline."""
+    for p, label in ((red_path, "RED"), (nir_path, "NIR")):
+        if not p or not os.path.exists(p):
+            raise RuntimeError(f"{label} path is missing or not found: {p}")
+    sar_c_path = sar_c_path if sar_c_path and os.path.exists(sar_c_path) else None
+    sar_l_path = sar_l_path if sar_l_path and os.path.exists(sar_l_path) else None
+    return run_pipeline(red_path, nir_path, sar_c_path, sar_l_path, output_dir)
+
+
+def process_from_arrays(
+    red_arr: np.ndarray,
+    nir_arr: np.ndarray,
+    sar_arr: np.ndarray | None,
+    output_dir: str,
+    green_arr: np.ndarray | None = None,
+    blue_arr: np.ndarray | None = None,
+):
+    """
+    Array-only fusion pipeline for GEE mode; never opens input file paths.
+    Returns trimmed arrays and fusion probabilities to feed overlays.
+    """
+    if red_arr is None or nir_arr is None:
+        raise RuntimeError("No GEE Sentinel-2 data in session; fetch from GEE first.")
+    fusion_messages: list[str] = []
+    red_arr = np.asarray(red_arr, dtype=np.float32)
+    nir_arr = np.asarray(nir_arr, dtype=np.float32)
+    if green_arr is None:
+        green_arr = red_arr
+        fusion_messages.append("TODO: export Sentinel-2 green band from GEE; using RED as proxy.")
+    if blue_arr is None:
+        blue_arr = red_arr
+        fusion_messages.append("TODO: export Sentinel-2 blue band from GEE; using RED as proxy.")
+    green_arr = np.asarray(green_arr, dtype=np.float32)
+    blue_arr = np.asarray(blue_arr, dtype=np.float32)
+
+    arrays_to_align = [red_arr, nir_arr, green_arr, blue_arr]
+    if sar_arr is not None:
+        arrays_to_align.append(np.asarray(sar_arr, dtype=np.float32))
+    h = min(arr.shape[0] for arr in arrays_to_align)
+    w = min(arr.shape[1] for arr in arrays_to_align)
+    red_arr = red_arr[:h, :w]
+    nir_arr = nir_arr[:h, :w]
+    green_arr = green_arr[:h, :w]
+    blue_arr = blue_arr[:h, :w]
+
+    sar_trimmed = None
+    if sar_arr is not None:
+        sar_trimmed = np.asarray(sar_arr, dtype=np.float32)[:h, :w]
+
+    if _RUN_PIPELINE_ARRAYS is not None:
+        efc_path, metrics, summary = _RUN_PIPELINE_ARRAYS(
+            red_arr, nir_arr, sar_c_arr=sar_trimmed, output_dir=output_dir
+        )
+    else:
+        # Lightweight fallback: compute NDVI and save a simple EFC-style PNG
+        ndvi = (nir_arr - red_arr) / (nir_arr + red_arr + 1e-8)
+        sar_db = 10 * np.log10(np.maximum(sar_trimmed, 1e-6)) if sar_trimmed is not None else None
+        efc_path = os.path.join(output_dir, "efc.png")
+        os.makedirs(output_dir, exist_ok=True)
+        from spectra_core.fusion import make_efc
+
+        make_efc(efc_path, ndvi, sar_db, None)
+        metrics = {
+            "ndvi_min": float(np.nanmin(ndvi)),
+            "ndvi_max": float(np.nanmax(ndvi)),
+            "ndvi_mean": float(np.nanmean(ndvi)),
+            "has_sar_c": sar_trimmed is not None,
+            "has_sar_l": False,
+            "array_mode": True,
+            "fallback": True,
+        }
+        summary = (
+            f"EFC (array mode fallback): NDVI range [{metrics['ndvi_min']:.3f}, {metrics['ndvi_max']:.3f}], "
+            f"SAR bands: {int(sar_trimmed is not None)}"
+        )
+        with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+        with open(os.path.join(output_dir, "summary.txt"), "w") as f:
+            f.write(summary)
+
+    fusion_outputs = None
+    if _RUN_OPTICAL_SAR_ARRAYS is not None:
+        fusion_outputs = _RUN_OPTICAL_SAR_ARRAYS(red_arr, green_arr, blue_arr, nir_arr, sar_trimmed)
+        fusion_outputs["messages"].extend(fusion_messages)
+    else:
+        zeros = np.zeros_like(red_arr, dtype=np.float32)
+        fusion_outputs = {
+            "p_opt": zeros,
+            "p_sar": zeros,
+            "p_fused": zeros,
+            "metadata": {},
+            "messages": fusion_messages
+            + ["Fusion helper unavailable; skipping AI deforestation probabilities."],
+        }
+
+    return efc_path, metrics, summary, red_arr, nir_arr, sar_trimmed, fusion_outputs, green_arr, blue_arr
 
 
 def get_project_root() -> str:
@@ -682,10 +851,12 @@ st.title("🛰️ SPECTRA Enhanced Forest Composite")
 st.markdown("Upload Sentinel-2 optical bands and optional SAR data to generate Enhanced Forest Composite visualizations.")
 ai_mode = st.sidebar.selectbox(
     "AI overlay",
-    ["EFC only", "EFC + AI detections"],
+    ["EFC only", "EFC + AI detections", "AI Deforestation (Optical + SAR Fusion)"],
     index=0,
 )
 show_raw_ai_mask = st.sidebar.checkbox("Show raw AI mask (0/1/2 classes)", value=False)
+if ai_mode == "AI Deforestation (Optical + SAR Fusion)":
+    st.sidebar.info("0.0 = no deforestation evidence, 1.0 = strong evidence (optical+SAR fused).")
 
 # Create tabs
 tabs = st.tabs(["EFC Fusion", "Change Detection", "Agentic Insights", "News"])
@@ -700,7 +871,16 @@ with st.sidebar:
     )
     st.markdown("### System status")
     status_icon = "✅" if ee_ok else "⚠️"
-    st.write(f"{status_icon} Earth Engine: {ee_msg}")
+    if ee_ok and ee_method == "service_account":
+        ee_status = f"Earth Engine: OK (service account: {ee_msg})"
+    elif ee_ok and ee_method == "oauth":
+        ee_status = "Earth Engine: OK (OAuth user credentials)"
+    else:
+        ee_status = f"Earth Engine: NOT initialized – {ee_msg}"
+    st.write(f"{status_icon} {ee_status}")
+    llm_enabled = bool(LLM_PROVIDER and LLM_PROVIDER.lower() != "none" and LLM_API_KEY)
+    llm_status = "✅ LLM configured" if llm_enabled else "ℹ️ LLM disabled (no secrets/env)."
+    st.write(llm_status)
 
 # Mode selector
 input_mode = st.sidebar.radio(
@@ -774,141 +954,141 @@ with efc_tab:
     loader_placeholder = st.empty()
 
     if st.sidebar.button("🚀 Run Fusion", type="primary"):
-        # Validate inputs based on mode
+        mode_key = "upload" if input_mode == "Upload files" else "server" if input_mode == "Use server files" else "gee"
         valid_inputs = False
         temp_inputs_dir = None
-        if input_mode == "Upload files":
+        s2_tile_for_overlay = None
+        s1_tile_for_overlay = None
+        fusion_outputs = None
+
+        if mode_key == "upload":
             if not red_file or not nir_file:
                 st.error("❌ Please upload both RED and NIR bands to proceed.")
             else:
                 valid_inputs = True
-        elif input_mode == "Use server files":
+        elif mode_key == "server":
             if not red_path or not nir_path or not os.path.exists(red_path) or not os.path.exists(nir_path):
                 st.error("❌ Please provide valid paths for both RED and NIR bands.")
-                valid_inputs = False
             else:
                 valid_inputs = True
-        elif input_mode == "Use GEE (Sentinel-2)":
+        elif mode_key == "gee":
             if not st.session_state.get("gee_ready"):
                 st.error("No GEE data loaded yet. Click 'Fetch Sentinel-2 from GEE' first.")
-                valid_inputs = False
             else:
                 valid_inputs = True
-        
+
         if valid_inputs:
             with loader_placeholder:
                 show_spectra_loader("Running SPECTRA fusion on satellite data…")
             with st.status("Processing fusion pipeline...", expanded=True) as status:
-                # Create session directories
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 upload_dir = f"uploads/{timestamp}"
                 output_dir = f"outputs/{timestamp}"
                 os.makedirs(upload_dir, exist_ok=True)
                 os.makedirs(output_dir, exist_ok=True)
                 tile_metadata = None
-                
+
                 try:
-                    if input_mode == "Upload files":
+                    if mode_key == "upload":
                         status.write("Saving uploaded files...")
-                        # Save uploaded files
                         red_path = os.path.join(upload_dir, "red.tif")
                         nir_path = os.path.join(upload_dir, "nir.tif")
-                        
+
                         with open(red_path, "wb") as f:
                             f.write(red_file.read())
                         with open(nir_path, "wb") as f:
                             f.write(nir_file.read())
-                        
+
                         if sar_c_file:
                             sar_c_path = os.path.join(upload_dir, "sar_c.tif")
                             with open(sar_c_path, "wb") as f:
                                 f.write(sar_c_file.read())
                         else:
                             sar_c_path = None
-                        
+
                         if sar_l_file:
                             sar_l_path = os.path.join(upload_dir, "sar_l.tif")
                             with open(sar_l_path, "wb") as f:
                                 f.write(sar_l_file.read())
                         else:
                             sar_l_path = None
-                    elif input_mode == "Use server files":
+                    elif mode_key == "server":
                         status.write("Using server files...")
-                        # Use server paths, clean empty strings
                         sar_c_path = sar_c_path if sar_c_path and os.path.exists(sar_c_path) else None
                         sar_l_path = sar_l_path if sar_l_path and os.path.exists(sar_l_path) else None
-                    elif input_mode == "Use GEE (Sentinel-2)":
+                    elif mode_key == "gee":
                         status.write("Using GEE arrays from session...")
                         red_arr = st.session_state.get("gee_red")
                         nir_arr = st.session_state.get("gee_nir")
+                        green_arr = st.session_state.get("gee_green")
+                        blue_arr = st.session_state.get("gee_blue")
                         sar_arr = st.session_state.get("gee_s1") if st.session_state.get("gee_s1_ready") else None
                         if red_arr is None or nir_arr is None:
-                            raise RuntimeError("GEE data missing. Please fetch again.")
-                        (
-                            efc_path,
-                            metrics,
-                            summary,
-                            red_path,
-                            nir_path,
-                            temp_inputs_dir,
-                        ) = run_fusion_from_gee_arrays(
-                            red_arr, nir_arr, output_dir=output_dir, c_sar_arr=sar_arr
+                            raise RuntimeError("No GEE Sentinel-2 data in session; fetch from GEE first.")
+                        efc_path, metrics, summary, red_arr, nir_arr, sar_arr, fusion_outputs, green_arr, blue_arr = process_from_arrays(
+                            red_arr, nir_arr, sar_arr, output_dir=output_dir, green_arr=green_arr, blue_arr=blue_arr
                         )
-                        sar_c_path = None
-                        sar_l_path = None
+                        s2_tile_for_overlay = np.stack([red_arr, green_arr, blue_arr, nir_arr], axis=-1)
+                        s1_tile_for_overlay = None if sar_arr is None else np.expand_dims(sar_arr, axis=-1)
+                        red_path = None
+                        nir_path = None
                         if st.session_state.get("gee_params"):
                             tile_metadata = dict(st.session_state.get("gee_params"))
-                    
-                    if input_mode != "Use GEE (Sentinel-2)":
+
+                    if mode_key != "gee":
                         status.write("Running fusion pipeline...")
-                        # Run pipeline
-                        efc_path, metrics, summary = run_pipeline(
+                        efc_path, metrics, summary = process_from_files(
                             red_path, nir_path, sar_c_path, sar_l_path, output_dir
                         )
                         tile_metadata = None
-                    
+
                     status.write("Computing insights...")
-                    # Compute NDVI summary for insights
-                    red_da = open_da(red_path)
-                    nir_da = open_da(nir_path)
-                    if red_da.rio.crs != nir_da.rio.crs or red_da.shape != nir_da.shape:
-                        nir_da = nir_da.rio.reproject_match(red_da)
-                    
+                    if mode_key == "gee":
+                        red_da = xr.DataArray(red_arr, dims=("y", "x"))
+                        nir_da = xr.DataArray(nir_arr, dims=("y", "x"))
+                    else:
+                        red_da = open_da(red_path)
+                        nir_da = open_da(nir_path)
+                        if red_da.rio.crs != nir_da.rio.crs or red_da.shape != nir_da.shape:
+                            nir_da = nir_da.rio.reproject_match(red_da)
+
                     summary = summarize_ndvi(red_da, nir_da)
                     st.session_state["fusion_summary"] = summary
-                    
-                    # Save summary to outputs
+
                     os.makedirs("outputs", exist_ok=True)
                     with open("outputs/fusion_summary.json", 'w') as f:
                         json.dump(summary, f, indent=2)
-                    
+
                     status.write("Generating report...")
-                    # Generate report
                     report_path = generate_report(output_dir)
-                    
-                    # Auto-cleanup uploaded files
-                    if input_mode == "Upload files":
+
+                    if mode_key == "upload":
                         status.write("Cleaning up temporary files...")
                         try:
                             shutil.rmtree(upload_dir)
                         except:
-                            pass  # Ignore cleanup errors
-                    
+                            pass
+
                     status.update(label="✅ Fusion completed successfully!", state="complete")
-                    
+
                     # Display results
                     col1, col2 = st.columns([2, 1])
-                    
+
                     with col1:
                         st.subheader("Enhanced Forest Composite")
                         ai_mask = None
+                        fusion_probs = None
+                        def _load_efc_rgb(path: str) -> np.ndarray:
+                            try:
+                                return open_da(path).data.transpose(1, 2, 0)
+                            except Exception:
+                                return np.array(Image.open(path).convert("RGB"))
+
                         if ai_mode == "EFC + AI detections" and AI_AVAILABLE:
                             try:
-                                model_path = st.secrets.get("ai", {}).get(
-                                    "unet_model_path", DEFAULT_UNET_MODEL_PATH
-                                )
+                                model_path = secrets_ai.get("unet_model_path", DEFAULT_UNET_MODEL_PATH)
                                 ai_mask = run_unet_on_efc_tile(
-                                    open_da(efc_path).data.transpose(1, 2, 0),
+                                    _load_efc_rgb(efc_path),
                                     model_path=model_path,
                                     device="cuda" if torch.cuda.is_available() else "cpu",
                                 )
@@ -916,7 +1096,6 @@ with efc_tab:
                                 def make_overlay_from_mask(mask_arr, alpha: float = 0.4):
                                     h, w = mask_arr.shape
                                     overlay = np.zeros((h, w, 4), dtype=np.uint8)
-                                    # 0 = background (transparent), 1 = vegetation (green), 2 = deforested (red).
                                     overlay[mask_arr == 1] = [0, 255, 0, int(alpha * 255)]
                                     overlay[mask_arr == 2] = [255, 0, 0, int(alpha * 255)]
                                     return overlay
@@ -930,11 +1109,120 @@ with efc_tab:
                             except Exception as e:  # noqa: BLE001
                                 st.warning(f"AI overlay unavailable ({e}); showing EFC only.")
                                 st.image(efc_path, caption="EFC Visualization", use_container_width=True)
+                        elif ai_mode == "AI Deforestation (Optical + SAR Fusion)":
+                            try:
+                                try:
+                                    from spectra_core.models.optical_sar_fusion import OpticalSarFusionModel  # type: ignore
+                                except ImportError:
+                                    OpticalSarFusionModel = None  # type: ignore
+                                from spectra_core.data.optical_sar_alignment import load_aligned_optical_sar_tiles
+
+                                def _make_prob_overlay(prob_arr: np.ndarray, alpha: float = 0.55) -> np.ndarray:
+                                    scaled = np.clip(prob_arr, 0.0, 1.0)
+                                    rgba = np.zeros((*scaled.shape, 4), dtype=np.uint8)
+                                    rgba[..., 0] = (scaled * 255).astype(np.uint8)
+                                    rgba[..., 1] = (scaled * 64).astype(np.uint8)
+                                    rgba[..., 3] = (scaled * alpha * 255).astype(np.uint8)
+                                    return rgba
+
+                                fusion_results = fusion_outputs
+                                fusion_notes: list[str] = []
+                                metadata: dict = {}
+
+                                if fusion_results is None:
+                                    if s2_tile_for_overlay is not None:
+                                        s2_tile = s2_tile_for_overlay
+                                        s1_tile = s1_tile_for_overlay
+                                    elif mode_key != "gee":
+                                        s1_candidate = sar_c_path or sar_l_path
+                                        s2_paths = {
+                                            "B04": red_path,
+                                            "B03": red_path,
+                                            "B02": red_path,
+                                            "B08": nir_path,
+                                        }
+                                        s2_tile, s1_tile, _, _ = load_aligned_optical_sar_tiles(s2_paths, s1_candidate)
+                                    else:
+                                        raise RuntimeError("No tile data available for fusion overlay.")
+
+                                    if _RUN_OPTICAL_SAR_ARRAYS is not None:
+                                        fusion_results = _RUN_OPTICAL_SAR_ARRAYS(
+                                            s2_tile[..., 0], s2_tile[..., 1], s2_tile[..., 2], s2_tile[..., 3], s1_tile
+                                        )
+                                    else:
+                                        zeros = np.zeros(s2_tile.shape[:2], dtype=np.float32)
+                                        fusion_results = {
+                                            "p_opt": zeros,
+                                            "p_sar": zeros,
+                                            "p_fused": zeros,
+                                            "metadata": {},
+                                            "messages": ["Fusion helper unavailable; showing EFC only."],
+                                        }
+
+                                if fusion_results is None:
+                                    overlay_shape = _load_efc_rgb(efc_path).shape[:2]
+                                    zeros = np.zeros(overlay_shape, dtype=np.float32)
+                                    fusion_results = {
+                                        "p_opt": zeros,
+                                        "p_sar": zeros,
+                                        "p_fused": zeros,
+                                        "metadata": {},
+                                        "messages": ["Fusion results unavailable; showing EFC only."],
+                                    }
+
+                                metadata = fusion_results.get("metadata", {}) or {}
+                                fusion_notes.extend(fusion_results.get("messages", []))
+                                p_opt = fusion_results.get("p_opt")
+                                p_sar = fusion_results.get("p_sar")
+                                fusion_probs = fusion_results.get("p_fused")
+                                if fusion_probs is None:
+                                    base = p_opt if p_opt is not None else _load_efc_rgb(efc_path)[..., 0]
+                                    fusion_probs = np.zeros_like(base, dtype=np.float32)
+
+                                fusion_model_path = get_fusion_model_path()
+                                if fusion_model_path and os.path.exists(fusion_model_path) and OpticalSarFusionModel:
+                                    try:
+                                        fusion_model = OpticalSarFusionModel(fusion_model_path)
+                                        fusion_probs = fusion_model.fuse(p_opt, p_sar)
+                                        fusion_notes.append(f"Fusion model loaded from: {fusion_model_path}")
+                                    except Exception as load_err:  # noqa: BLE001
+                                        fusion_notes.append(f"Fusion model error ({load_err}); using simple average.")
+
+                                fusion_overlay = _make_prob_overlay(fusion_probs)
+                                st.image(
+                                    [efc_path, fusion_overlay],
+                                    caption=[
+                                        "EFC Visualization",
+                                        "Fused deforestation probability (optical + SAR)"
+                                        if p_sar is not None and not np.allclose(p_sar, 0.0)
+                                        else "Optical-only deforestation probability",
+                                    ],
+                                    use_container_width=True,
+                                )
+                                sar_used = p_sar is not None and not np.allclose(p_sar, 0.0)
+                                if sar_used:
+                                    st.success("Using both optical and SAR U-Nets for fused AI deforestation.")
+                                else:
+                                    st.info("Using optical UNet for deforestation; SAR model unavailable or disabled.")
+                                weight_lines = []
+                                if metadata.get("optical_weight"):
+                                    weight_lines.append(f"Optical weights: UNet-defmapping/{metadata['optical_weight']}")
+                                if metadata.get("sar_weight"):
+                                    weight_lines.append(f"SAR weights: unet-sentinel/{metadata['sar_weight']}")
+                                if weight_lines:
+                                    st.caption("; ".join(weight_lines))
+                                for note in fusion_notes:
+                                    st.info(note)
+                                st.caption("0.0 = no deforestation evidence, 1.0 = strong evidence (optical+SAR fusion).")
+                            except Exception as e:  # noqa: BLE001
+                                st.warning(f"Fusion overlay unavailable ({e}); showing EFC only.")
+                                st.image(efc_path, caption="EFC Visualization", use_container_width=True)
                         else:
                             if ai_mode == "EFC + AI detections" and not AI_AVAILABLE:
                                 st.warning(f"AI overlay is disabled: {AI_IMPORT_ERROR}")
                             st.image(efc_path, caption="EFC Visualization", use_container_width=True)
-                        efc_rgb_current = open_da(efc_path).data.transpose(1, 2, 0).astype(np.uint8)
+
+                        efc_rgb_current = _load_efc_rgb(efc_path).astype(np.uint8)
                         st.session_state["efc_rgb"] = efc_rgb_current
                         st.session_state["efc_tile_metadata"] = tile_metadata
                         if show_raw_ai_mask and ai_mask is not None:
@@ -972,8 +1260,11 @@ with efc_tab:
 
                 except Exception as e:  # noqa: BLE001
                     status.update(label="❌ Processing failed", state="error")
-                    st.error(f"❌ Error processing files: {str(e)}")
-                    st.info("Please ensure files are valid GeoTIFF format.")
+                    st.error(f"❌ Error processing data: {str(e)}")
+                    if mode_key == "gee":
+                        st.info("Check GEE arrays (Sentinel-2/Sentinel-1) and try again.")
+                    else:
+                        st.info("Please ensure files are valid GeoTIFF format.")
                 finally:
                     if temp_inputs_dir:
                         shutil.rmtree(temp_inputs_dir, ignore_errors=True)

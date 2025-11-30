@@ -21,3 +21,12 @@ google-generativeai
 earthengine-api
 torch
 torchvision
+lightning
+lightning-bolts; python_version < "3.12" # for compatibility
+pytorch-lightning
+s3fs
+tensorflow
+keras
+scikit-learn
+gdal
+joblib
