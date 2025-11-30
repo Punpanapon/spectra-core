@@ -14,7 +14,7 @@ primaryColor = "#FF4B4B"
 backgroundColor = "#020617"          # very dark blue/black
 
 # Cards / sidebars background
-secondaryBackgroundColor = "#0B1120" # slightly lighter than background
+secondaryBackgroundColor = "#1F2933" # brighter cards
 
 # Text color
 textColor = "#FFFFFF"
