@@ -7,12 +7,20 @@ maxUploadSize = 400
 maxMessageSize = 2048
 
 [theme]
-primaryColor = "#38B2AC"
-backgroundColor = "#020617"
-secondaryBackgroundColor = "#020617"
-textColor = "#E2E8F0"
+# Main accent (button) color - this is the classic Streamlit red
+primaryColor = "#FF4B4B"
+
+# Page background (outer area)
+backgroundColor = "#020617"          # very dark blue/black
+
+# Cards / sidebars background
+secondaryBackgroundColor = "#0B1120" # slightly lighter than background
+
+# Text color
+textColor = "#FFFFFF"
+
+# Optional: font
 font = "sans serif"
-base = "dark"
 
 [ui]
 hideTopBar = false
